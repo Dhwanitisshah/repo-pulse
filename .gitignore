@@ -1,0 +1,17 @@
+# Go
+/ingest/bin/
+/ingest/vendor/
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.pyc
+.env
+*/.env
+
+# Node
+**/node_modules/
+**/dist/
+
+# Misc
+.DS_Store
