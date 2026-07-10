@@ -1,6 +1,22 @@
 import { useEffect, useState } from "react";
 import { fetchRecentEvents } from "./api.js";
 
+function relativeTime(ts) {
+  if (!ts) return "";
+  const seconds = Math.round((Date.now() - ts) / 1000);
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+function describeEvent(e) {
+  return e.payload_action ? `${e.event_type} (${e.payload_action})` : e.event_type;
+}
+
 export default function App() {
   const [events, setEvents] = useState([]);
   const [error, setError] = useState(null);
@@ -40,13 +56,14 @@ export default function App() {
       {error && <p style={{ color: "red" }}>Error: {error}</p>}
 
       <section>
-        <h2>Latest heartbeat</h2>
+        <h2>Latest event</h2>
         {latest ? (
           <p>
-            seq <strong>{latest.seq}</strong> @ {new Date(latest.ts).toLocaleTimeString()}
+            <strong>{latest.repo}</strong> — {describeEvent(latest)} by {latest.actor} (
+            {relativeTime(latest.ts)})
           </p>
         ) : (
-          <p>Waiting for heartbeats…</p>
+          <p>Waiting for events…</p>
         )}
       </section>
 
@@ -55,7 +72,7 @@ export default function App() {
         <ul>
           {[...events].reverse().map((e) => (
             <li key={e.id}>
-              seq {e.seq} — {new Date(e.ts).toLocaleTimeString()}
+              <strong>{e.repo}</strong> — {describeEvent(e)} by {e.actor} ({relativeTime(e.ts)})
             </li>
           ))}
         </ul>

@@ -16,6 +16,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    env_file:
+      - ./ingest/.env
     environment:
       REDIS_ADDR: redis:6379
 

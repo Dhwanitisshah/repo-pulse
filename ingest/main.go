@@ -5,62 +5,49 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
-	"time"
 
 	"github.com/redis/go-redis/v9"
-)
 
-const streamName = "events"
+	ghclient "repo-pulse/ingest/internal/github"
+)
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+	cfg, err := loadConfig()
+	if err != nil {
+		slog.Error("invalid configuration", "error", err)
+		os.Exit(1)
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
+	slog.Info("ingest starting",
+		"redis_addr", cfg.RedisAddr,
+		"watched_repos", cfg.WatchedRepos,
+		"poll_interval", cfg.PollInterval.String(),
+		"stream", streamName,
+	)
+
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	defer rdb.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("ingest starting", "redis_addr", redisAddr, "stream", streamName)
+	ghc := ghclient.NewClient(cfg.GitHubToken)
 
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
-	var seq int64
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("shutdown signal received, closing redis client")
-			return
-		case <-ticker.C:
-			seq++
-			ts := time.Now().UnixMilli()
-
-			id, err := rdb.XAdd(ctx, &redis.XAddArgs{
-				Stream: streamName,
-				Values: map[string]interface{}{
-					"type": "heartbeat",
-					"ts":   ts,
-					"seq":  seq,
-				},
-			}).Result()
-
-			if err != nil {
-				slog.Error("failed to publish heartbeat", "error", err, "seq", seq)
-				continue
-			}
-
-			slog.Info("heartbeat published", "id", id, "seq", seq, "ts", ts)
-		}
+	var wg sync.WaitGroup
+	for _, repo := range cfg.WatchedRepos {
+		poller := newRepoPoller(ghc, rdb, repo, cfg.PollInterval)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			poller.run(ctx)
+		}()
 	}
+
+	wg.Wait()
+	slog.Info("shutdown complete, redis client closed")
 }
