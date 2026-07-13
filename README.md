@@ -3,11 +3,11 @@
 A Go → Redis Streams → Python/FastAPI → React pipeline. The Go `ingest`
 service polls the GitHub Events API for a configured list of repositories and
 publishes normalized events onto a Redis Stream, the Python `api` service
-consumes the stream and exposes it over HTTP, and the React `frontend` polls
-the API and shows recent activity.
+consumes the stream, aggregates windowed counts, and exposes it all over
+HTTP, and the React `frontend` polls the API and shows a live dashboard.
 
-No aggregation yet — the frontend renders a raw recent-events list. That's a
-later phase.
+Counts-only aggregation for now (per-repo / per-type / timeline). PR lifecycle
+metrics (open→merge time etc.) are a later phase.
 
 ## GitHub polling (`ingest`)
 
@@ -88,6 +88,30 @@ curl http://localhost:8000/stream/health
 curl http://localhost:8000/events/recent
 ```
 
+## Windowed aggregation (`api`): tumbling minute buckets
+
+As each event is consumed and acked (see above), `record_event` increments a
+few Redis counters keyed by **minute bucket** (`ts // 60000`):
+
+- `stats:count:{repo}:{bucket}` — per-repo total for that minute
+- `stats:type:{repo}:{event_type}:{bucket}` — per-repo, per-type
+- `stats:global:{event_type}:{bucket}` — global per-type
+- `stats:repos` / `stats:event_types` — small sets tracking everything seen,
+  so the reader knows what to look up
+
+All three counters (plus their `EXPIRE`) go out in a single pipeline per
+event — one round trip. Every bucket key expires **2 hours** after its last
+write, well past the widest supported query window, so old buckets self-clean
+without a separate cleanup job.
+
+`GET /stats?window={5,15,60}` (default 15) reads the last N one-minute
+buckets and sums them in Python via batched `MGET`s (no N+1 Redis calls),
+returning per-repo counts, per-type counts, a per-repo-by-type breakdown, and
+a `timeline` (per-minute totals across the window) for the frontend's
+sparkline. Aggregates are **only** computed from these Redis counters, never
+from the in-memory `recent_events` deque — that deque is a capped display
+buffer for `/events/recent`, not a source of truth.
+
 ## Run everything with Docker Compose
 
 ```bash
@@ -96,7 +120,7 @@ docker compose up --build
 ```
 
 - Redis: `localhost:6379`
-- API: http://localhost:8000 (`/health`, `/events/recent`)
+- API: http://localhost:8000 (`/health`, `/events/recent`, `/stats`, `/stream/health`)
 - Frontend: http://localhost:4173
 
 Watch the `ingest` logs for polls, new-event counts, and rate-limit state, and
@@ -155,6 +179,6 @@ Then open http://localhost:5173.
 
 ```
 /ingest    Go service — polls the GitHub Events API and publishes normalized events to Redis Stream "events"
-/api       FastAPI service — consumes the stream via a Redis consumer group, serves /health, /events/recent, /stream/health
+/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts, serves /health, /events/recent, /stats, /stream/health
 /frontend  Vite + React app — polls the API and displays recent GitHub activity
 ```

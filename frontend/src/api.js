@@ -7,3 +7,11 @@ export async function fetchRecentEvents() {
   }
   return res.json();
 }
+
+export async function fetchStats(windowMinutes) {
+  const res = await fetch(`${API_BASE_URL}/stats?window=${windowMinutes}`);
+  if (!res.ok) {
+    throw new Error(`request failed: ${res.status}`);
+  }
+  return res.json();
+}

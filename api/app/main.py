@@ -4,9 +4,10 @@ from collections import deque
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import aggregate
 from app.config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -63,6 +64,7 @@ async def _process_and_ack(client: redis.Redis, message_id: str, fields: dict) -
     # process dies before this point the message stays pending and is
     # replayed to this consumer on restart (at-least-once delivery).
     await client.xack(settings.stream_name, settings.consumer_group, message_id)
+    await aggregate.record_event(client, event)
 
 
 async def _drain_pending(client: redis.Redis) -> None:
@@ -161,6 +163,23 @@ async def health():
 @app.get("/events/recent")
 async def events_recent():
     return list(recent_events)
+
+
+VALID_STATS_WINDOWS = {5, 15, 60}
+
+
+@app.get("/stats")
+async def stats(window: int = 15):
+    if window not in VALID_STATS_WINDOWS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"window must be one of {sorted(VALID_STATS_WINDOWS)}",
+        )
+    client = _make_client()
+    try:
+        return await aggregate.read_window(client, window)
+    finally:
+        await client.aclose()
 
 
 @app.get("/stream/health")

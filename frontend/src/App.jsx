@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fetchRecentEvents } from "./api.js";
+import Dashboard from "./Dashboard.jsx";
 
 function relativeTime(ts) {
   if (!ts) return "";
@@ -20,6 +21,7 @@ function describeEvent(e) {
 export default function App() {
   const [events, setEvents] = useState([]);
   const [error, setError] = useState(null);
+  const [showRawEvents, setShowRawEvents] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -47,35 +49,37 @@ export default function App() {
     };
   }, []);
 
-  const latest = events[events.length - 1];
-
   return (
-    <div style={{ fontFamily: "sans-serif", maxWidth: 600, margin: "2rem auto" }}>
+    <div style={{ fontFamily: "sans-serif", maxWidth: 800, margin: "2rem auto" }}>
       <h1>repo-pulse</h1>
 
       {error && <p style={{ color: "red" }}>Error: {error}</p>}
 
-      <section>
-        <h2>Latest event</h2>
-        {latest ? (
-          <p>
-            <strong>{latest.repo}</strong> — {describeEvent(latest)} by {latest.actor} (
-            {relativeTime(latest.ts)})
-          </p>
-        ) : (
-          <p>Waiting for events…</p>
-        )}
-      </section>
+      <Dashboard />
 
-      <section>
-        <h2>Recent events</h2>
-        <ul>
-          {[...events].reverse().map((e) => (
-            <li key={e.id}>
-              <strong>{e.repo}</strong> — {describeEvent(e)} by {e.actor} ({relativeTime(e.ts)})
-            </li>
-          ))}
-        </ul>
+      <section style={{ marginTop: "2rem" }}>
+        <button
+          onClick={() => setShowRawEvents((v) => !v)}
+          style={{
+            padding: "0.3rem 0.6rem",
+            border: "1px solid #ccc",
+            borderRadius: 4,
+            background: "white",
+            cursor: "pointer",
+          }}
+        >
+          {showRawEvents ? "Hide" : "Show"} raw recent events
+        </button>
+
+        {showRawEvents && (
+          <ul style={{ marginTop: "0.75rem" }}>
+            {[...events].reverse().map((e) => (
+              <li key={e.id}>
+                <strong>{e.repo}</strong> — {describeEvent(e)} by {e.actor} ({relativeTime(e.ts)})
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
     </div>
   );
