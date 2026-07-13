@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
-import { fetchStats } from "./api.js";
+import { fetchPrStats, fetchStats } from "./api.js";
 
 const WINDOW_OPTIONS = [5, 15, 60];
+
+function formatDuration(hours) {
+  if (hours == null) return "—";
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  if (hours < 48) return `${hours.toFixed(1)}h`;
+  return `${(hours / 24).toFixed(1)}d`;
+}
 
 function BarRow({ label, count, maxCount }) {
   const pct = maxCount > 0 ? Math.round((count / maxCount) * 100) : 0;
@@ -44,6 +51,95 @@ function Timeline({ timeline }) {
         />
       ))}
     </div>
+  );
+}
+
+function PrLifecycle() {
+  const [prStats, setPrStats] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const data = await fetchPrStats();
+        if (!cancelled) {
+          setPrStats(data);
+          setError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message);
+        }
+      }
+    }
+
+    poll();
+    const interval = setInterval(poll, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  const repos = prStats ? Object.keys(prStats).sort() : [];
+  const totalUnmatched = repos.reduce((sum, r) => sum + prStats[r].unmatched_merges, 0);
+
+  return (
+    <section style={{ marginTop: "2rem" }}>
+      <h2 style={{ marginBottom: "0.3rem" }}>PR merge times</h2>
+
+      {error && <p style={{ color: "red" }}>Error: {error}</p>}
+
+      {!prStats ? (
+        <p>Loading…</p>
+      ) : repos.length === 0 ? (
+        <p style={{ color: "#999" }}>No PR activity tracked yet</p>
+      ) : (
+        <>
+          <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.9rem" }}>
+            <thead>
+              <tr style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>
+                <th style={{ padding: "0.3rem 0.6rem 0.3rem 0" }}>Repo</th>
+                <th style={{ padding: "0.3rem 0.6rem" }}>Median</th>
+                <th style={{ padding: "0.3rem 0.6rem" }}>p90</th>
+                <th style={{ padding: "0.3rem 0.6rem" }}>Merged</th>
+                <th style={{ padding: "0.3rem 0.6rem" }}>Open (tracked)</th>
+                <th style={{ padding: "0.3rem 0.6rem" }}>Unmatched</th>
+              </tr>
+            </thead>
+            <tbody>
+              {repos.map((repo) => {
+                const s = prStats[repo];
+                return (
+                  <tr key={repo} style={{ borderBottom: "1px solid #eee" }}>
+                    <td style={{ padding: "0.3rem 0.6rem 0.3rem 0" }}>{repo}</td>
+                    <td style={{ padding: "0.3rem 0.6rem" }}>
+                      {formatDuration(s.median_merge_hours)}
+                    </td>
+                    <td style={{ padding: "0.3rem 0.6rem" }}>{formatDuration(s.p90_merge_hours)}</td>
+                    <td style={{ padding: "0.3rem 0.6rem" }}>{s.merged_count}</td>
+                    <td style={{ padding: "0.3rem 0.6rem" }}>{s.open_prs_tracked}</td>
+                    <td style={{ padding: "0.3rem 0.6rem" }}>{s.unmatched_merges}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {totalUnmatched > 0 && (
+            <p style={{ color: "#666", fontSize: "0.8rem", marginTop: "0.5rem" }}>
+              {totalUnmatched} unmatched merge{totalUnmatched === 1 ? "" : "s"}: PRs that were
+              opened before this service started watching, so their full open→merge duration
+              can't be measured. GitHub's Events API only exposes recent activity per repo — this
+              is a known data-source limit, not a bug.
+            </p>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -149,6 +245,8 @@ export default function Dashboard() {
           </div>
         </>
       )}
+
+      <PrLifecycle />
     </section>
   );
 }

@@ -7,7 +7,7 @@ import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import aggregate
+from app import aggregate, pr_lifecycle
 from app.config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -48,6 +48,9 @@ def _fields_to_event(message_id: str, fields: dict) -> dict:
         "created_at": fields.get("created_at"),
         "ts": int(fields["ts"]) if "ts" in fields else None,
         "payload_action": fields.get("payload_action", ""),
+        # Only present on PullRequestEvent (see ingest/internal/github/client.go).
+        "pr_number": int(fields["pr_number"]) if "pr_number" in fields else None,
+        "pr_merged": fields.get("pr_merged") == "1" if "pr_merged" in fields else None,
     }
 
 
@@ -65,6 +68,7 @@ async def _process_and_ack(client: redis.Redis, message_id: str, fields: dict) -
     # replayed to this consumer on restart (at-least-once delivery).
     await client.xack(settings.stream_name, settings.consumer_group, message_id)
     await aggregate.record_event(client, event)
+    await pr_lifecycle.record_pr_event(client, event)
 
 
 async def _drain_pending(client: redis.Redis) -> None:
@@ -178,6 +182,15 @@ async def stats(window: int = 15):
     client = _make_client()
     try:
         return await aggregate.read_window(client, window)
+    finally:
+        await client.aclose()
+
+
+@app.get("/stats/pr")
+async def stats_pr():
+    client = _make_client()
+    try:
+        return await pr_lifecycle.read_pr_stats(client)
     finally:
         await client.aclose()
 

@@ -15,3 +15,11 @@ export async function fetchStats(windowMinutes) {
   }
   return res.json();
 }
+
+export async function fetchPrStats() {
+  const res = await fetch(`${API_BASE_URL}/stats/pr`);
+  if (!res.ok) {
+    throw new Error(`request failed: ${res.status}`);
+  }
+  return res.json();
+}

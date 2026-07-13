@@ -51,6 +51,25 @@ func (e Event) Action() string {
 	return p.Action
 }
 
+// PullRequest returns the PR number and merged flag from a PullRequestEvent
+// payload. ok is false for any other event type, or if the payload doesn't
+// parse. merged is only meaningful when the event's action is "closed".
+func (e Event) PullRequest() (number int64, merged bool, ok bool) {
+	if e.Type != "PullRequestEvent" || len(e.Payload) == 0 {
+		return 0, false, false
+	}
+	var p struct {
+		PullRequest struct {
+			Number int64 `json:"number"`
+			Merged bool  `json:"merged"`
+		} `json:"pull_request"`
+	}
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		return 0, false, false
+	}
+	return p.PullRequest.Number, p.PullRequest.Merged, true
+}
+
 // Client polls the GitHub repository events endpoint.
 type Client struct {
 	httpClient *http.Client

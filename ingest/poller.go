@@ -147,6 +147,11 @@ func (p *repoPoller) publishOne(ctx context.Context, e ghclient.Event) {
 		"payload_action": e.Action(),
 	}
 
+	if number, merged, ok := e.PullRequest(); ok {
+		values["pr_number"] = number
+		values["pr_merged"] = merged
+	}
+
 	id, err := p.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamName,
 		Values: values,

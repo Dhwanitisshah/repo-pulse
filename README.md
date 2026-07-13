@@ -3,11 +3,9 @@
 A Go → Redis Streams → Python/FastAPI → React pipeline. The Go `ingest`
 service polls the GitHub Events API for a configured list of repositories and
 publishes normalized events onto a Redis Stream, the Python `api` service
-consumes the stream, aggregates windowed counts, and exposes it all over
-HTTP, and the React `frontend` polls the API and shows a live dashboard.
-
-Counts-only aggregation for now (per-repo / per-type / timeline). PR lifecycle
-metrics (open→merge time etc.) are a later phase.
+consumes the stream, aggregates windowed counts and PR merge-time stats, and
+exposes it all over HTTP, and the React `frontend` polls the API and shows a
+live dashboard.
 
 ## GitHub polling (`ingest`)
 
@@ -28,6 +26,11 @@ Each event is normalized before being added to the `events` stream:
 ```
 source, event_id, event_type, repo, actor, created_at, ts, payload_action
 ```
+
+For `PullRequestEvent` only, two extra fields are added so the API can
+correlate a PR's open and close: `pr_number` and `pr_merged` (the latter is
+only meaningful when `payload_action` is `closed`). No other event type
+carries these fields.
 
 ### Env vars
 
@@ -112,6 +115,44 @@ sparkline. Aggregates are **only** computed from these Redis counters, never
 from the in-memory `recent_events` deque — that deque is a capped display
 buffer for `/events/recent`, not a source of truth.
 
+## PR merge-time tracking (`api`): stateful open→merge correlation
+
+Unlike the 3a counts above, this is **correlational, not a simple counter**:
+a PR's `opened` event and its `closed` (merged) event can be hours or days
+apart, so the API has to remember in-flight PRs between the two.
+
+- `pr:open:{repo}` — a Redis hash of `{pr_number: open_ts_ms}` for PRs
+  currently in flight.
+- On `opened`: `HSET` the PR into that hash.
+- On `closed` with `merged=true`: `HGET` the open timestamp.
+  - **Found** → compute the duration, `ZADD` it into
+    `pr:durations:{repo}` (score = duration in seconds, so `ZRANGE
+    ...WITHSCORES` gives sorted durations for percentile math), then
+    `HDEL` the in-flight entry.
+  - **Not found** → increment `pr:unmatched:{repo}` and move on. See below —
+    this is expected, not an error.
+- On `closed` with `merged=false`: just `HDEL` the in-flight entry (a closed,
+  unmerged PR isn't a "merge time").
+- `pr:durations:{repo}` is capped at ~500 entries via `ZREMRANGEBYRANK` so it
+  can't grow unbounded.
+
+`GET /stats/pr` returns, per repo: `merged_count`, `median_merge_seconds` /
+`_hours`, `p90_merge_seconds` / `_hours`, `fastest`/`slowest`, plus
+`unmatched_merges` and `open_prs_tracked`. Percentiles use the nearest-rank
+method over the sorted duration list.
+
+### The honest limitation: "unmatched" merges
+
+The GitHub Events API only returns recent activity per repo (roughly the last
+~300 events / 90 days). If a PR was opened before `ingest` started watching a
+repo, its `opened` event was never seen — but its eventual `closed` (merged)
+event will be. That merge is real, but its true duration is unknowable from
+this data source alone, so it's counted in `unmatched_merges` instead of
+being assigned a fabricated or estimated duration. This is surfaced directly
+in the API response and in the frontend (with an explanation), rather than
+silently dropped or guessed at — the gap is part of the design, not a bug to
+paper over.
+
 ## Run everything with Docker Compose
 
 ```bash
@@ -120,7 +161,7 @@ docker compose up --build
 ```
 
 - Redis: `localhost:6379`
-- API: http://localhost:8000 (`/health`, `/events/recent`, `/stats`, `/stream/health`)
+- API: http://localhost:8000 (`/health`, `/events/recent`, `/stats`, `/stats/pr`, `/stream/health`)
 - Frontend: http://localhost:4173
 
 Watch the `ingest` logs for polls, new-event counts, and rate-limit state, and
@@ -179,6 +220,6 @@ Then open http://localhost:5173.
 
 ```
 /ingest    Go service — polls the GitHub Events API and publishes normalized events to Redis Stream "events"
-/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts, serves /health, /events/recent, /stats, /stream/health
+/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts and PR merge times, serves /health, /events/recent, /stats, /stats/pr, /stream/health
 /frontend  Vite + React app — polls the API and displays recent GitHub activity
 ```
