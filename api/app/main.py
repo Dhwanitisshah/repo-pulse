@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 
@@ -7,7 +8,7 @@ import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import aggregate, pr_lifecycle
+from app import aggregate, anomaly, pr_lifecycle
 from app.config import settings
 from app.ws import ConnectionManager, EventCoalescer, FLUSH_INTERVAL_SECONDS, MAX_EVENTS_PER_PUSH
 
@@ -18,8 +19,15 @@ recent_events: deque[dict] = deque(maxlen=settings.max_events)
 
 XREAD_BLOCK_MS = 5000
 
+# Detection doesn't need 500ms cadence like the event flush -- it runs on its
+# own, slower interval aligned with the minute-bucket cadence it reads from.
+ANOMALY_INTERVAL_SECONDS = 20
+
 manager = ConnectionManager()
 coalescer = EventCoalescer()
+anomaly_detector = anomaly.AnomalyDetector()
+active_anomalies: list[dict] = []
+anomaly_snapshot_status = {"status": "warming_up", "buckets_seen": 0}
 
 
 def _make_client() -> redis.Redis:
@@ -178,14 +186,50 @@ async def flush_loop() -> None:
         await client.aclose()
 
 
+async def anomaly_loop() -> None:
+    """Every ANOMALY_INTERVAL_SECONDS, recompute bucket series from Redis,
+    run detection, and broadcast any newly-fired anomalies. Runs on its own
+    (slower) cadence from flush_loop's 500ms event push -- detection reads
+    minute buckets, so checking faster than once every few seconds buys
+    nothing."""
+    global active_anomalies, anomaly_snapshot_status
+    client = _make_client()
+    try:
+        while True:
+            await asyncio.sleep(ANOMALY_INTERVAL_SECONDS)
+
+            series = await aggregate.read_series(client, settings.anomaly_baseline_minutes + 1)
+            now_bucket = aggregate.minute_bucket(int(time.time() * 1000))
+
+            newly_fired, active = anomaly_detector.tick(series, now_bucket)
+            active_anomalies = active
+            status, buckets_seen = anomaly.warmup_status(series)
+            anomaly_snapshot_status = {"status": status, "buckets_seen": buckets_seen}
+
+            if newly_fired:
+                await manager.broadcast(
+                    {
+                        "type": "anomaly",
+                        "anomalies": newly_fired,
+                        "detected_at": anomaly.now_iso(),
+                    }
+                )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await client.aclose()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     consume_task = asyncio.create_task(consume_events())
     flush_task = asyncio.create_task(flush_loop())
+    anomaly_task = asyncio.create_task(anomaly_loop())
     yield
     consume_task.cancel()
     flush_task.cancel()
-    for task in (consume_task, flush_task):
+    anomaly_task.cancel()
+    for task in (consume_task, flush_task, anomaly_task):
         try:
             await task
         except asyncio.CancelledError:
@@ -261,6 +305,17 @@ async def stats_pr():
         return await pr_lifecycle.read_pr_stats(client)
     finally:
         await client.aclose()
+
+
+@app.get("/anomalies")
+async def anomalies():
+    return {
+        "status": anomaly_snapshot_status["status"],
+        "anomalies": active_anomalies,
+        "baseline_minutes": settings.anomaly_baseline_minutes,
+        "min_baseline": settings.anomaly_min_baseline,
+        "buckets_seen": anomaly_snapshot_status["buckets_seen"],
+    }
 
 
 @app.get("/stream/health")

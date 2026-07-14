@@ -69,6 +69,43 @@ async def record_event(redis_client, event: dict) -> None:
     await pipe.execute()
 
 
+async def read_series(redis_client, window_minutes: int) -> dict[str, dict]:
+    """Per-repo (and per-repo-per-type) raw bucket-count series, oldest
+    bucket first, for the last `window_minutes` buckets. Unlike read_window
+    this doesn't sum the buckets — anomaly detection (app/anomaly.py) needs
+    the individual per-minute counts to compute a rolling baseline against
+    the current bucket."""
+    buckets = bucket_range(window_minutes)
+    n = len(buckets)
+
+    repos = sorted(await redis_client.smembers(REPOS_KEY))
+    event_types = sorted(await redis_client.smembers(EVENT_TYPES_KEY))
+
+    count_keys = [count_key(repo, bucket) for repo in repos for bucket in buckets]
+    count_values = await redis_client.mget(count_keys) if count_keys else []
+
+    rt_keys = [
+        type_key(repo, event_type, bucket)
+        for repo in repos
+        for event_type in event_types
+        for bucket in buckets
+    ]
+    rt_values = await redis_client.mget(rt_keys) if rt_keys else []
+
+    series: dict[str, dict] = {}
+    for i, repo in enumerate(repos):
+        repo_counts = [int(v) if v is not None else 0 for v in count_values[i * n:(i + 1) * n]]
+        types: dict[str, list[int]] = {}
+        for j, event_type in enumerate(event_types):
+            idx = (i * len(event_types) + j) * n
+            type_counts = [int(v) if v is not None else 0 for v in rt_values[idx:idx + n]]
+            if any(type_counts):
+                types[event_type] = type_counts
+        series[repo] = {"repo": repo_counts, "types": types}
+
+    return series
+
+
 async def read_window(redis_client, window_minutes: int) -> dict:
     buckets = bucket_range(window_minutes)
 

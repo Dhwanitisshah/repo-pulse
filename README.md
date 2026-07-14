@@ -3,9 +3,10 @@
 A Go → Redis Streams → Python/FastAPI → React pipeline. The Go `ingest`
 service polls the GitHub Events API for a configured list of repositories and
 publishes normalized events onto a Redis Stream, the Python `api` service
-consumes the stream, aggregates windowed counts and PR merge-time stats, and
-exposes it all over HTTP, and the React `frontend` polls the API and shows a
-live dashboard.
+consumes the stream, aggregates windowed counts and PR merge-time stats,
+detects anomalies against a rolling baseline, and exposes it all over HTTP
+and a WebSocket, and the React `frontend` shows a live dashboard driven by
+that push.
 
 ## GitHub polling (`ingest`)
 
@@ -194,6 +195,92 @@ that window is selected (simpler than teaching the socket protocol a
 or the 5m/60m fallback above. The WebSocket is additive transport, not a
 replacement for the HTTP API.
 
+## Anomaly detection (`api`): rolling baseline over minute buckets
+
+This is the "instrument that tells you when to look" layer — a statistical
+detector, not ML, built entirely on top of the minute-bucket counters from
+windowed aggregation above. It reads no new raw events and stores no new raw
+state; it's pure synthesis of data already sitting in Redis.
+
+**Method: rolling mean ± Nσ.** Every `ANOMALY_INTERVAL_SECONDS` (20s,
+`api/app/main.py`), the API re-reads each repo's (and repo+event-type's)
+last `ANOMALY_BASELINE_MINUTES + 1` one-minute bucket counts
+(`aggregate.read_series`), splits off the current bucket, and computes the
+mean and population stddev of everything before it. The current bucket is
+flagged (`velocity_spike`) if:
+
+```
+current >= ANOMALY_MIN_ABSOLUTE  AND  current > mean + ANOMALY_SIGMA * stddev
+```
+
+Two guards keep this from being noisy:
+
+- **Warm-up guard** — a series needs at least `ANOMALY_MIN_BASELINE`
+  non-empty baseline buckets before it's judged at all. A repo the detector
+  has barely seen yet stays silent rather than alerting on thin data; `GET
+  /anomalies` reports this honestly as `status: "warming_up"` plus how many
+  buckets have been seen so far, instead of pretending to have an opinion.
+- **Absolute floor** — `ANOMALY_MIN_ABSOLUTE` ignores small-count noise (a
+  repo going from 0 to 2 events/min is not a "spike" worth paging over) even
+  when the relative jump is huge.
+
+**Flat-baseline fallback.** If the baseline has zero variance (stddev == 0 —
+e.g. a repo steady at exactly 4 events/min for 30 minutes), the σ-based
+comparison can't divide by zero. Instead the detector falls back to
+`max(ANOMALY_MIN_ABSOLUTE, mean * 4)` as the flag threshold, and reports a
+mean-multiple ratio in place of a true z-score (`api/app/anomaly.py`,
+`FLAT_BASELINE_MULTIPLIER`) — informational, not a statistical claim.
+
+**A second, qualitatively different signal: `activity_stall`.** A repo with
+a healthy baseline (mean at/above `ANOMALY_MIN_ABSOLUTE`) whose last 3
+buckets are all zero is flagged as having gone quiet — the inverse of a
+spike, surfacing a repo going dark rather than one getting loud. (A third
+signal, `pr_queue_growth` — open PRs rising while merges stall — was
+considered but skipped: `pr_lifecycle` only tracks a live snapshot of
+`open_prs_tracked`, not a bucketed history of it, and building that history
+would mean new stored state beyond the existing minute buckets, which is out
+of scope for a pure-synthesis detector.)
+
+**Cooldown.** A fired `(repo, scope, kind)` won't re-broadcast for
+`ANOMALY_COOLDOWN_MINUTES` even if it's still true on the next tick — kept
+in-memory per API process (`AnomalyDetector` in `api/app/anomaly.py`), not in
+Redis, since re-broadcasting the same condition every 20s would be spammy,
+not useful. An anomaly stays in the "currently active" snapshot for a while
+after its last fire even while re-broadcast is suppressed, so `GET
+/anomalies` and a client that just connected still see it.
+
+### Config (`api/app/config.py`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ANOMALY_BASELINE_MINUTES` | 30 | How many past buckets form the baseline |
+| `ANOMALY_MIN_BASELINE` | 10 | Non-empty baseline buckets required before detecting (warm-up) |
+| `ANOMALY_SIGMA` | 3.0 | Flag when `current > mean + SIGMA * stddev` |
+| `ANOMALY_MIN_ABSOLUTE` | 5 | Ignore spikes below this absolute count |
+| `ANOMALY_COOLDOWN_MINUTES` | 5 | Suppress re-firing the same anomaly within this window |
+
+### Transport
+
+- **`WS /ws`** gains an additive message type, `anomaly` —
+  `{ type, anomalies, detected_at }` — pushed only when something new fires;
+  it never replaces or interrupts the existing `snapshot`/`update` messages.
+- **`GET /anomalies`** — `{ status: "warming_up" | "active", anomalies,
+  baseline_minutes, min_baseline, buckets_seen }`. Used for debugging and as
+  the frontend's initial-load snapshot (the WS push alone would leave a
+  freshly-loaded dashboard blank until the next tick).
+
+**Frontend** (`frontend/src/useEventStream.js`, `Dashboard.jsx`): active
+anomalies are kept in a map keyed by repo+scope+kind (a re-fire refreshes
+rather than duplicates) and pruned client-side after 5 minutes if nothing
+refreshes them — independent of the server's own active-window bookkeeping,
+just a UI safety net against a stale alert lingering forever if a push is
+missed. An **Alerts** section renders at the top of the dashboard (above
+Pulse) — the headline, since an instrument should surface what needs
+attention before anything else — showing each anomaly's repo, what spiked or
+stalled, current vs. baseline with σ, and a severity color; a warming-up or
+all-clear state is shown honestly rather than an empty section. A repo with
+an active anomaly gets its Per-repo row highlighted.
+
 ## Run everything with Docker Compose
 
 ```bash
@@ -202,7 +289,7 @@ docker compose up --build
 ```
 
 - Redis: `localhost:6379`
-- API: http://localhost:8000 (`WS /ws`, `/health`, `/events/recent`, `/stats`, `/stats/pr`, `/stream/health`)
+- API: http://localhost:8000 (`WS /ws`, `/health`, `/events/recent`, `/stats`, `/stats/pr`, `/anomalies`, `/stream/health`)
 - Frontend: http://localhost:4173
 
 Watch the `ingest` logs for polls, new-event counts, and rate-limit state, and
@@ -261,6 +348,6 @@ Then open http://localhost:5173.
 
 ```
 /ingest    Go service — polls the GitHub Events API and publishes normalized events to Redis Stream "events"
-/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts and PR merge times, pushes live updates over WS /ws, serves /health, /events/recent, /stats, /stats/pr, /stream/health
+/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts and PR merge times, detects anomalies against a rolling baseline, pushes live updates over WS /ws, serves /health, /events/recent, /stats, /stats/pr, /anomalies, /stream/health
 /frontend  Vite + React app — polls the API and displays recent GitHub activity
 ```

@@ -1,14 +1,25 @@
-import { useEffect, useState } from "react";
-import { API_BASE_URL } from "./api.js";
+import { useEffect, useRef, useState } from "react";
+import { API_BASE_URL, fetchAnomalies } from "./api.js";
 
 const MAX_RECENT_EVENTS = 50;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
+// How long a fired anomaly stays visible client-side if it isn't refreshed
+// by a later push or REST fetch — a fading, not a hard cutoff tied to the
+// server's own ANOMALY_ACTIVE_TTL (api/app/anomaly.py), just a UI nicety so
+// a stale alert doesn't linger forever if this tab misses updates.
+const ANOMALY_CLIENT_TTL_MS = 5 * 60 * 1000;
+const ANOMALY_PRUNE_INTERVAL_MS = 30 * 1000;
+
 function wsUrl() {
   const url = new URL("/ws", API_BASE_URL);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+function anomalyKey(a) {
+  return `${a.repo}|${a.scope}|${a.kind}`;
 }
 
 /**
@@ -18,12 +29,60 @@ function wsUrl() {
  * api/app/ws.py). Auto-reconnects on close/error with exponential backoff
  * (1s, 2s, 4s, ... capped at 15s), resetting the backoff once a connection
  * actually opens.
+ *
+ * Anomalies are a separate, additive push ("anomaly" message) and separate
+ * REST snapshot (GET /anomalies, fetched once on mount) — they don't ride
+ * along with "snapshot"/"update". Active anomalies are kept in a map keyed
+ * by repo+scope+kind so a re-fire refreshes rather than duplicates, and
+ * pruned on a timer against ANOMALY_CLIENT_TTL_MS so a stale one fades if
+ * nothing refreshes it.
  */
 export default function useEventStream() {
   const [status, setStatus] = useState("connecting"); // connecting | live | reconnecting
   const [stats, setStats] = useState(null);
   const [pr, setPr] = useState(null);
   const [recent, setRecent] = useState([]);
+  const [anomalies, setAnomalies] = useState([]);
+  const [anomalyStatus, setAnomalyStatus] = useState(null); // { status, baseline_minutes, buckets_seen }
+
+  const anomalyMapRef = useRef(new Map());
+
+  function commitAnomalies() {
+    const now = Date.now();
+    for (const [key, a] of anomalyMapRef.current) {
+      if (now - a.bucket_ts > ANOMALY_CLIENT_TTL_MS) {
+        anomalyMapRef.current.delete(key);
+      }
+    }
+    setAnomalies([...anomalyMapRef.current.values()]);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchAnomalies()
+      .then((data) => {
+        if (cancelled) return;
+        for (const a of data.anomalies) {
+          anomalyMapRef.current.set(anomalyKey(a), a);
+        }
+        commitAnomalies();
+        setAnomalyStatus({
+          status: data.status,
+          baseline_minutes: data.baseline_minutes,
+          min_baseline: data.min_baseline,
+          buckets_seen: data.buckets_seen,
+        });
+      })
+      .catch(() => {
+        // Non-fatal: the WS "anomaly" push will populate this once connected.
+      });
+
+    const pruneTimer = setInterval(commitAnomalies, ANOMALY_PRUNE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(pruneTimer);
+    };
+  }, []);
 
   useEffect(() => {
     let closedByUs = false;
@@ -55,6 +114,11 @@ export default function useEventStream() {
           setStats(message.stats);
           setPr(message.pr);
           setRecent((prev) => [...prev, ...message.events].slice(-MAX_RECENT_EVENTS));
+        } else if (message.type === "anomaly") {
+          for (const a of message.anomalies) {
+            anomalyMapRef.current.set(anomalyKey(a), a);
+          }
+          commitAnomalies();
         }
       };
 
@@ -81,5 +145,5 @@ export default function useEventStream() {
     };
   }, []);
 
-  return { status, stats, pr, recent };
+  return { status, stats, pr, recent, anomalies, anomalyStatus };
 }

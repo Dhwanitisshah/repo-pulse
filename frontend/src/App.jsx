@@ -20,13 +20,19 @@ function describeEvent(e) {
 
 export default function App() {
   const [showRawEvents, setShowRawEvents] = useState(false);
-  const { status, stats, pr, recent } = useEventStream();
+  const { status, stats, pr, recent, anomalies, anomalyStatus } = useEventStream();
 
   return (
     <div style={{ fontFamily: "sans-serif", maxWidth: 800, margin: "2rem auto" }}>
       <h1>repo-pulse</h1>
 
-      <Dashboard liveStats={stats} prStats={pr} connectionStatus={status} />
+      <Dashboard
+        liveStats={stats}
+        prStats={pr}
+        connectionStatus={status}
+        anomalies={anomalies}
+        anomalyStatus={anomalyStatus}
+      />
 
       <section style={{ marginTop: "2rem" }}>
         <button

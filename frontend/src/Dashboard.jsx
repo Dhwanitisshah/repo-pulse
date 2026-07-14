@@ -10,10 +10,18 @@ function formatDuration(hours) {
   return `${(hours / 24).toFixed(1)}d`;
 }
 
-function BarRow({ label, count, maxCount }) {
+function BarRow({ label, count, maxCount, highlighted }) {
   const pct = maxCount > 0 ? Math.round((count / maxCount) * 100) : 0;
   return (
-    <div style={{ marginBottom: "0.4rem" }}>
+    <div
+      style={{
+        marginBottom: "0.4rem",
+        padding: highlighted ? "0.2rem 0.3rem" : 0,
+        borderRadius: 4,
+        background: highlighted ? "#fef2f2" : "transparent",
+        boxShadow: highlighted ? "inset 3px 0 0 #dc2626" : "none",
+      }}
+    >
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem" }}>
         <span>{label}</span>
         <span>{count}</span>
@@ -30,6 +38,76 @@ function BarRow({ label, count, maxCount }) {
         />
       </div>
     </div>
+  );
+}
+
+const SEVERITY_COLORS = {
+  spike: "#dc2626",
+  elevated: "#f59e0b",
+};
+
+function describeAnomaly(a) {
+  const label = a.scope === "repo" ? "repo-wide" : a.scope.replace(/^type:/, "");
+  if (a.kind === "activity_stall") {
+    return `${label} went quiet — 0 events now vs ~${a.baseline_mean} avg`;
+  }
+  return `${label}: ${a.current} now vs ~${a.baseline_mean} avg, ${a.sigma}σ`;
+}
+
+function AnomalyCard({ anomaly }) {
+  const color = SEVERITY_COLORS[anomaly.severity] ?? "#666";
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: "0.75rem",
+        padding: "0.5rem 0.75rem",
+        borderRadius: 6,
+        marginBottom: "0.4rem",
+        background: anomaly.severity === "spike" ? "#fef2f2" : "#fffbeb",
+        borderLeft: `4px solid ${color}`,
+      }}
+    >
+      <span style={{ fontSize: "0.85rem" }}>
+        <strong>{anomaly.repo}</strong> — {describeAnomaly(anomaly)}
+      </span>
+      <span
+        style={{
+          fontSize: "0.7rem",
+          fontWeight: 600,
+          textTransform: "uppercase",
+          color,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {anomaly.severity}
+      </span>
+    </div>
+  );
+}
+
+// The headline section: an instrument surfaces what needs attention first,
+// so this renders above Pulse/PR lifecycle rather than tucked at the bottom.
+function Alerts({ anomalies, anomalyStatus }) {
+  return (
+    <section style={{ marginBottom: "1.5rem" }}>
+      <h2 style={{ marginBottom: "0.4rem" }}>Alerts</h2>
+      {anomalies.length > 0 ? (
+        anomalies.map((a) => <AnomalyCard key={`${a.repo}|${a.scope}|${a.kind}`} anomaly={a} />)
+      ) : !anomalyStatus ? (
+        <p style={{ color: "#999", fontSize: "0.85rem" }}>Loading…</p>
+      ) : anomalyStatus.status === "warming_up" ? (
+        <p style={{ color: "#999", fontSize: "0.85rem" }}>
+          Baseline warming up ({anomalyStatus.buckets_seen}/{anomalyStatus.min_baseline} min buckets seen)
+        </p>
+      ) : (
+        <p style={{ color: "#999", fontSize: "0.85rem" }}>
+          No anomalies — activity within normal range.
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -159,8 +237,9 @@ const LIVE_WINDOW_MINUTES = 15;
 // dependency here means: refetch when there's genuinely new data, stay
 // silent when idle. A tab parked on 5m/60m with no activity fires exactly
 // one GET /stats on window-select and then nothing.
-export default function Dashboard({ liveStats, prStats, connectionStatus }) {
+export default function Dashboard({ liveStats, prStats, connectionStatus, anomalies, anomalyStatus }) {
   const [windowMinutes, setWindowMinutes] = useState(LIVE_WINDOW_MINUTES);
+  const anomalousRepos = new Set((anomalies ?? []).map((a) => a.repo));
   const [manualStats, setManualStats] = useState(null);
   const [manualError, setManualError] = useState(null);
 
@@ -199,6 +278,8 @@ export default function Dashboard({ liveStats, prStats, connectionStatus }) {
 
   return (
     <section>
+      <Alerts anomalies={anomalies ?? []} anomalyStatus={anomalyStatus} />
+
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
           <h2 style={{ margin: 0 }}>Pulse</h2>
@@ -245,7 +326,13 @@ export default function Dashboard({ liveStats, prStats, connectionStatus }) {
                 <p style={{ color: "#999" }}>No activity yet</p>
               ) : (
                 stats.per_repo.map((r) => (
-                  <BarRow key={r.repo} label={r.repo} count={r.count} maxCount={maxRepoCount} />
+                  <BarRow
+                    key={r.repo}
+                    label={r.repo}
+                    count={r.count}
+                    maxCount={maxRepoCount}
+                    highlighted={anomalousRepos.has(r.repo)}
+                  />
                 ))
               )}
             </div>

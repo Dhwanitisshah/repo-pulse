@@ -26,3 +26,13 @@ export async function fetchPrStats() {
   }
   return res.json();
 }
+
+// Initial-load snapshot of active anomalies; live updates arrive over the
+// WebSocket "anomaly" message (see useEventStream.js) after this.
+export async function fetchAnomalies() {
+  const res = await fetch(`${API_BASE_URL}/anomalies`);
+  if (!res.ok) {
+    throw new Error(`request failed: ${res.status}`);
+  }
+  return res.json();
+}
