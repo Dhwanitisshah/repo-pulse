@@ -153,6 +153,47 @@ in the API response and in the frontend (with an explanation), rather than
 silently dropped or guessed at — the gap is part of the design, not a bug to
 paper over.
 
+## Live transport: WebSocket push (`WS /ws`)
+
+The dashboard no longer polls. It opens a WebSocket to `WS /ws` and the
+server pushes updates as events arrive.
+
+- **On connect**, the server immediately sends a `snapshot` message —
+  `{ type, stats, pr, recent }`, where `stats` is `read_window(15)` (3a),
+  `pr` is `read_pr_stats()` (3b), and `recent` is the last N raw events — so
+  a newly-connected client has full state without waiting for anything else.
+- **Coalesced push, not per-event.** The consumer loop doesn't broadcast
+  synchronously per event (that would firehose the client on the startup
+  backlog — ~90 events at once). Instead each processed event is appended to
+  an in-memory buffer, and a separate flush task drains it **every 500ms**
+  (`FLUSH_INTERVAL_SECONDS` in `api/app/ws.py` — tune it there) and, if
+  anything happened, broadcasts one `update` message:
+  `{ type, event_count, events, stats, pr }`. `events` is capped at 50
+  entries (`MAX_EVENTS_PER_PUSH`) — a huge burst still sends its true
+  `event_count` plus a truncated sample, never thousands of rows. An empty
+  interval sends nothing (no heartbeat) — the client's own `onclose`/
+  `onerror` handlers are what detect a dropped connection, not a missed tick.
+- **`ConnectionManager`** (`api/app/ws.py`) tracks connected sockets and
+  broadcasts to a snapshot of the set, so one dead connection can't block
+  delivery to the rest.
+
+**Client** (`frontend/src/useEventStream.js`): replaces `snapshot` state
+wholesale, merges `update` state (prepends/caps the event list, replaces
+stats/pr), and **auto-reconnects** on close/error with exponential backoff
+(1s → 2s → 4s → ... capped at 15s), resetting the backoff on a successful
+open. A small green/amber dot next to "Pulse" shows `live` vs
+`connecting`/`reconnecting` — the visible proof it's push, not poll.
+
+The 15-minute window streams live at no HTTP cost. Switching to the 5m/60m
+window falls back to a lightweight REST poll of `GET /stats` for as long as
+that window is selected (simpler than teaching the socket protocol a
+"change window" message); switching back to 15m goes back to pure push.
+
+**REST endpoints are unchanged and still work** — `/stats`, `/stats/pr`,
+`/events/recent`, `/stream/health` all remain, useful for debugging, `curl`,
+or the 5m/60m fallback above. The WebSocket is additive transport, not a
+replacement for the HTTP API.
+
 ## Run everything with Docker Compose
 
 ```bash
@@ -161,7 +202,7 @@ docker compose up --build
 ```
 
 - Redis: `localhost:6379`
-- API: http://localhost:8000 (`/health`, `/events/recent`, `/stats`, `/stats/pr`, `/stream/health`)
+- API: http://localhost:8000 (`WS /ws`, `/health`, `/events/recent`, `/stats`, `/stats/pr`, `/stream/health`)
 - Frontend: http://localhost:4173
 
 Watch the `ingest` logs for polls, new-event counts, and rate-limit state, and
@@ -220,6 +261,6 @@ Then open http://localhost:5173.
 
 ```
 /ingest    Go service — polls the GitHub Events API and publishes normalized events to Redis Stream "events"
-/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts and PR merge times, serves /health, /events/recent, /stats, /stats/pr, /stream/health
+/api       FastAPI service — consumes the stream via a Redis consumer group, aggregates windowed counts and PR merge times, pushes live updates over WS /ws, serves /health, /events/recent, /stats, /stats/pr, /stream/health
 /frontend  Vite + React app — polls the API and displays recent GitHub activity
 ```

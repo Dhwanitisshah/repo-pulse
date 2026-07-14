@@ -4,11 +4,12 @@ from collections import deque
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import aggregate, pr_lifecycle
 from app.config import settings
+from app.ws import ConnectionManager, EventCoalescer, FLUSH_INTERVAL_SECONDS, MAX_EVENTS_PER_PUSH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("repo-pulse.api")
@@ -16,6 +17,9 @@ logger = logging.getLogger("repo-pulse.api")
 recent_events: deque[dict] = deque(maxlen=settings.max_events)
 
 XREAD_BLOCK_MS = 5000
+
+manager = ConnectionManager()
+coalescer = EventCoalescer()
 
 
 def _make_client() -> redis.Redis:
@@ -69,6 +73,10 @@ async def _process_and_ack(client: redis.Redis, message_id: str, fields: dict) -
     await client.xack(settings.stream_name, settings.consumer_group, message_id)
     await aggregate.record_event(client, event)
     await pr_lifecycle.record_pr_event(client, event)
+    # Buffered, not broadcast synchronously: flush_loop() batches this with
+    # whatever else lands in the same coalescing window (see app/ws.py) so a
+    # burst (e.g. the startup backlog) becomes one push, not a firehose.
+    coalescer.add(event)
 
 
 async def _drain_pending(client: redis.Redis) -> None:
@@ -137,15 +145,51 @@ async def consume_events() -> None:
         await client.aclose()
 
 
+async def flush_loop() -> None:
+    """Every FLUSH_INTERVAL_SECONDS, drain the coalescing buffer and, if
+    anything happened, push one batched "update" to all connected clients.
+    Stats/PR are recomputed from Redis on each flush (not accumulated in
+    memory) so a client that missed messages while disconnected still ends
+    up consistent on the next push, and on reconnect gets a fresh snapshot."""
+    client = _make_client()
+    try:
+        while True:
+            await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
+
+            pending = coalescer.drain()
+            if not pending:
+                # No events processed this window means aggregates/PR stats
+                # can't have changed either (both are only ever updated
+                # alongside an event in _process_and_ack) -- skip the push.
+                continue
+
+            await manager.broadcast(
+                {
+                    "type": "update",
+                    "event_count": len(pending),
+                    "events": pending[-MAX_EVENTS_PER_PUSH:],
+                    "stats": await aggregate.read_window(client, 15),
+                    "pr": await pr_lifecycle.read_pr_stats(client),
+                }
+            )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await client.aclose()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(consume_events())
+    consume_task = asyncio.create_task(consume_events())
+    flush_task = asyncio.create_task(flush_loop())
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    consume_task.cancel()
+    flush_task.cancel()
+    for task in (consume_task, flush_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="repo-pulse api", lifespan=lifespan)
@@ -162,6 +206,30 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    client = _make_client()
+    try:
+        await websocket.send_json(
+            {
+                "type": "snapshot",
+                "stats": await aggregate.read_window(client, 15),
+                "pr": await pr_lifecycle.read_pr_stats(client),
+                "recent": list(recent_events),
+            }
+        )
+        while True:
+            # The client never sends anything meaningful; this just blocks
+            # until the socket closes so we notice the disconnect.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        manager.disconnect(websocket)
+        await client.aclose()
 
 
 @app.get("/events/recent")

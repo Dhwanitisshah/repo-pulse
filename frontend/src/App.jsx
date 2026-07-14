@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
-import { fetchRecentEvents } from "./api.js";
+import { useState } from "react";
 import Dashboard from "./Dashboard.jsx";
+import useEventStream from "./useEventStream.js";
 
 function relativeTime(ts) {
   if (!ts) return "";
@@ -19,43 +19,14 @@ function describeEvent(e) {
 }
 
 export default function App() {
-  const [events, setEvents] = useState([]);
-  const [error, setError] = useState(null);
   const [showRawEvents, setShowRawEvents] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function poll() {
-      try {
-        const data = await fetchRecentEvents();
-        if (!cancelled) {
-          setEvents(data);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err.message);
-        }
-      }
-    }
-
-    poll();
-    const interval = setInterval(poll, 2000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, []);
+  const { status, stats, pr, recent } = useEventStream();
 
   return (
     <div style={{ fontFamily: "sans-serif", maxWidth: 800, margin: "2rem auto" }}>
       <h1>repo-pulse</h1>
 
-      {error && <p style={{ color: "red" }}>Error: {error}</p>}
-
-      <Dashboard />
+      <Dashboard liveStats={stats} prStats={pr} connectionStatus={status} />
 
       <section style={{ marginTop: "2rem" }}>
         <button
@@ -73,8 +44,11 @@ export default function App() {
 
         {showRawEvents && (
           <ul style={{ marginTop: "0.75rem" }}>
-            {[...events].reverse().map((e) => (
-              <li key={e.id}>
+            {[...recent].reverse().map((e, i) => (
+              // Events pushed via a WebSocket "update" are compact (no `id` —
+              // see EventCoalescer in api/app/ws.py), unlike the full events
+              // in the initial snapshot, so key needs a synthetic fallback.
+              <li key={e.id ?? `${e.ts}-${e.repo}-${e.actor}-${i}`}>
                 <strong>{e.repo}</strong> — {describeEvent(e)} by {e.actor} ({relativeTime(e.ts)})
               </li>
             ))}

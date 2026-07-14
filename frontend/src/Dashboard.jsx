@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fetchPrStats, fetchStats } from "./api.js";
+import { fetchStats } from "./api.js";
 
 const WINDOW_OPTIONS = [5, 15, 60];
 
@@ -33,6 +33,38 @@ function BarRow({ label, count, maxCount }) {
   );
 }
 
+const STATUS_COLORS = {
+  live: "#22c55e",
+  connecting: "#f59e0b",
+  reconnecting: "#f59e0b",
+};
+
+const STATUS_LABELS = {
+  live: "live",
+  connecting: "connecting…",
+  reconnecting: "reconnecting…",
+};
+
+function ConnectionStatus({ status }) {
+  return (
+    <span
+      title={STATUS_LABELS[status] ?? status}
+      style={{ display: "inline-flex", alignItems: "center", gap: "0.3rem", fontSize: "0.75rem", color: "#666" }}
+    >
+      <span
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: "50%",
+          background: STATUS_COLORS[status] ?? "#999",
+          display: "inline-block",
+        }}
+      />
+      {STATUS_LABELS[status] ?? status}
+    </span>
+  );
+}
+
 function Timeline({ timeline }) {
   const max = Math.max(1, ...timeline.map((t) => t.count));
   return (
@@ -54,44 +86,16 @@ function Timeline({ timeline }) {
   );
 }
 
-function PrLifecycle() {
-  const [prStats, setPrStats] = useState(null);
-  const [error, setError] = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function poll() {
-      try {
-        const data = await fetchPrStats();
-        if (!cancelled) {
-          setPrStats(data);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err.message);
-        }
-      }
-    }
-
-    poll();
-    const interval = setInterval(poll, 5000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, []);
-
+// prStats is pushed over the WebSocket (see useEventStream.js) — no polling
+// of its own, and it isn't windowed like the Pulse stats above, so switching
+// the 5m/15m/60m selector doesn't affect it.
+function PrLifecycle({ prStats }) {
   const repos = prStats ? Object.keys(prStats).sort() : [];
   const totalUnmatched = repos.reduce((sum, r) => sum + prStats[r].unmatched_merges, 0);
 
   return (
     <section style={{ marginTop: "2rem" }}>
       <h2 style={{ marginBottom: "0.3rem" }}>PR merge times</h2>
-
-      {error && <p style={{ color: "red" }}>Error: {error}</p>}
 
       {!prStats ? (
         <p>Loading…</p>
@@ -143,36 +147,52 @@ function PrLifecycle() {
   );
 }
 
-export default function Dashboard() {
-  const [windowMinutes, setWindowMinutes] = useState(15);
-  const [stats, setStats] = useState(null);
-  const [error, setError] = useState(null);
+const LIVE_WINDOW_MINUTES = 15;
+
+// The server streams window=15 by default over the WebSocket. For the other
+// window sizes, rather than teaching the socket protocol a "change window"
+// message, we fetch /stats ONCE when the user selects a non-15 window — no
+// setInterval. `liveStats` (from useEventStream) only changes identity when
+// the server actually pushes a WS "update", which itself only happens when
+// real events were processed (see flush_loop in api/app/ws.py — it skips the
+// broadcast entirely on an empty interval). So using it as an effect
+// dependency here means: refetch when there's genuinely new data, stay
+// silent when idle. A tab parked on 5m/60m with no activity fires exactly
+// one GET /stats on window-select and then nothing.
+export default function Dashboard({ liveStats, prStats, connectionStatus }) {
+  const [windowMinutes, setWindowMinutes] = useState(LIVE_WINDOW_MINUTES);
+  const [manualStats, setManualStats] = useState(null);
+  const [manualError, setManualError] = useState(null);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function poll() {
-      try {
-        const data = await fetchStats(windowMinutes);
-        if (!cancelled) {
-          setStats(data);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err.message);
-        }
-      }
+    if (windowMinutes === LIVE_WINDOW_MINUTES) {
+      setManualStats(null);
+      setManualError(null);
+      return;
     }
 
-    poll();
-    const interval = setInterval(poll, 3000);
+    let cancelled = false;
+
+    fetchStats(windowMinutes)
+      .then((data) => {
+        if (!cancelled) {
+          setManualStats(data);
+          setManualError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setManualError(err.message);
+        }
+      });
 
     return () => {
       cancelled = true;
-      clearInterval(interval);
     };
-  }, [windowMinutes]);
+  }, [windowMinutes, liveStats]);
+
+  const stats = windowMinutes === LIVE_WINDOW_MINUTES ? liveStats : manualStats;
+  const error = windowMinutes === LIVE_WINDOW_MINUTES ? null : manualError;
 
   const maxRepoCount = stats ? Math.max(0, ...stats.per_repo.map((r) => r.count)) : 0;
   const maxTypeCount = stats ? Math.max(0, ...stats.per_type.map((t) => t.count)) : 0;
@@ -180,7 +200,10 @@ export default function Dashboard() {
   return (
     <section>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <h2 style={{ margin: 0 }}>Pulse</h2>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+          <h2 style={{ margin: 0 }}>Pulse</h2>
+          <ConnectionStatus status={connectionStatus} />
+        </div>
         <div>
           {WINDOW_OPTIONS.map((w) => (
             <button
@@ -246,7 +269,7 @@ export default function Dashboard() {
         </>
       )}
 
-      <PrLifecycle />
+      <PrLifecycle prStats={prStats} />
     </section>
   );
 }
