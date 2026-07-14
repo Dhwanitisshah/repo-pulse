@@ -145,21 +145,39 @@ function ConnectionStatus({ status }) {
 
 function Timeline({ timeline }) {
   const max = Math.max(1, ...timeline.map((t) => t.count));
+  const height = 60;
+  const baselinePx = 3;
+  const minActivePx = 6;
   return (
-    <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 60 }}>
-      {timeline.map((point) => (
-        <div
-          key={point.bucket_ts}
-          title={`${new Date(point.bucket_ts).toLocaleTimeString()} — ${point.count} events`}
-          style={{
-            flex: 1,
-            height: `${Math.round((point.count / max) * 100)}%`,
-            minHeight: point.count > 0 ? 2 : 1,
-            background: point.count > 0 ? "#3b82f6" : "#eee",
-            borderRadius: 1,
-          }}
-        />
-      ))}
+    <div style={{ position: "relative", height }}>
+      <div
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: baselinePx / 2,
+          height: 1,
+          background: "#e5e7eb",
+        }}
+      />
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 1, height: "100%", position: "relative" }}>
+        {timeline.map((point) => {
+          const scaledPx = Math.round((point.count / max) * height);
+          const barHeight = point.count > 0 ? Math.max(scaledPx, minActivePx) : baselinePx;
+          return (
+            <div
+              key={point.bucket_ts}
+              title={`${new Date(point.bucket_ts).toLocaleTimeString()} — ${point.count} events`}
+              style={{
+                flex: 1,
+                height: barHeight,
+                background: point.count > 0 ? "#3b82f6" : "#cbd5e1",
+                borderRadius: 1,
+              }}
+            />
+          );
+        })}
+      </div>
     </div>
   );
 }
